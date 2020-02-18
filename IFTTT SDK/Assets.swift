@@ -44,6 +44,6 @@ struct Assets {
 
 private extension UIImage {
     static func iftttAsset(named: String) -> UIImage {
-        return UIImage(named: named, in: Bundle.sdk, compatibleWith: nil)!
+        return UIImage(named: named, in: Bundle.sdk, compatibleWith: nil) ?? UIImage()
     }
 }
