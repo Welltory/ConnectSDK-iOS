@@ -7,11 +7,18 @@
 
 import Foundation
 
+private extension Date {
+    /// Returns the number of milliseconds between `self` and 00:00:00 UTC on 1 January 1970. Rounded to remove any trailing decimals.
+    var roundedMillisecondsSince1970: String {
+        return "\(Int64((timeIntervalSince1970 * 1000).rounded()))"
+    }
+}
+
 /// Handles sending analytics events for the SDK.
 final class Analytics {
     // MARK: - Configurable
-    /// Boolean value that enables or disables analytics collection. By default, this value is set to `false`.
-    var enabled: Bool = false {
+    /// Boolean value that enables or disables analytics collection. By default, this value is set to `true`.
+    var enabled: Bool = true {
         didSet {
             if !enabled {
                 stop()
@@ -116,13 +123,6 @@ final class Analytics {
         }
     }
     
-    /// An instance of `AnalyticsData` that contains some default parameters sent on every analytics request.
-    private static var defaultParameters: AnalyticsData {
-        return [
-            "timestamp": Int64((Date().timeIntervalSince1970 * 1000).rounded()),
-        ]
-    }
-    
     /// Runs the parameter closure on the appropriate `DispatchQueue`.
     ///
     /// - Parameters:
@@ -148,7 +148,7 @@ final class Analytics {
     
     /// Starts the analytics collection. Safe to be run from a background thread.
     private func start() {
-        guard !hasBeenStarted else { return }
+        if hasBeenStarted { return }
         hasBeenStarted = true
         
         Analytics.log("Starting...")
@@ -166,7 +166,7 @@ final class Analytics {
     
     /// Stops analytics collection.
     private func stop() {
-        guard hasBeenStarted else { return }
+        if !hasBeenStarted { return }
         hasBeenStarted = false
         
         Analytics.log("Stopping...")
@@ -230,10 +230,10 @@ final class Analytics {
             sanitizedData["state"] = state.rawValue
         }
         
-        let properties = Analytics.defaultParameters.merging(sanitizedData) { (_, new) in new }
         return [
             "name": event.name,
-            "properties": properties
+            "properties": sanitizedData,
+            "timestamp": Date().roundedMillisecondsSince1970
         ]
     }
     
