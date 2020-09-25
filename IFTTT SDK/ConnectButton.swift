@@ -278,7 +278,7 @@ public class ConnectButton: UIView {
     /// - Parameters:
     ///   - placeholderText: The placeholder text for the email field when it is empty
     ///   - confirmButtonImage: The image asset to use for the email confirm button
-    func configureEmailField(placeholderText: String, confirmButtonAsset: UIImage) {
+    func configureEmailField(placeholderText: String, confirmButtonAsset: UIImage?) {
         emailEntryField.placeholder = placeholderText
         emailConfirmButton.imageView.image = confirmButtonAsset
     }
@@ -311,7 +311,7 @@ public class ConnectButton: UIView {
     }
     
     private let footerLabelAnimator = LabelAnimator {
-        $0.numberOfLines = 1
+        $0.numberOfLines = 0
         $0.textAlignment = .center
         $0.lineBreakMode = .byTruncatingMiddle
     }    
@@ -331,13 +331,10 @@ public class ConnectButton: UIView {
     
     // MARK: Layout
     
-    /// A key used by an app to determine if it should hide the footer on the Connect Button.
-    static let shouldHideFooterUserDefaultsKey = "appShouldHideConnectButtonFooter"
-    
     private func createLayout() {
         
         // In some cases, we need to hide the footer on the Connect Button SDK. Introducing a key check to determine if the footer should be shown.
-        let shouldHideFooter = UserDefaults.standard.bool(forKey: ConnectButton.shouldHideFooterUserDefaultsKey)
+        let shouldHideFooter = UserDefaults.shouldHideFooter
         
         let stackView: UIStackView
         

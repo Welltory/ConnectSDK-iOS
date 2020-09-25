@@ -8,42 +8,143 @@
 import Foundation
 import CoreLocation
 
-/**
- Monitors a set of regions associated with the user's applets.
- Caps the number of regions monitored by the system to `Constants.MaxCoreLocationManagerMonitoredRegionsCount`.
- Once the monitored regions associated with applets exceeds `Constants.MaxCoreLocationManagerMonitoredRegionsCount`, the service starts monitoring visits the user makes to only monitor the `Constants.MaxCoreLocationManagerMonitoredRegionsCount` closest regions to the user's location.
-*/
-final class LocationService: NSObject {
-    /// Describes an region event initiated by region monitoring.
-    typealias RegionEvent = (CLRegion) -> Void
-    
-    /// Describes a failure in region monitoring.
-    typealias RegionMonitorFailEvent = (CLRegion?, Error) -> Void
-    
-    /// Describes a location authorization event initiated by the user or when adding monitored regions.
-    typealias LocationAuthorizationEvent = (CLAuthorizationStatus, CLLocationManager) -> Void
-    
-    /// Closure that gets called when monitoring begins for a specific region.
-    var didStartMonitoringRegion: RegionEvent?
-    
-    /// Closure that gets called when monitoring fails for a specific region.
-    var didFailMonitoringRegion: RegionMonitorFailEvent?
-    
-    /// Closure that gets called when the user enters a region.
-    var didEnterRegion: RegionEvent?
-    
-    /// Closure that gets called when the user exits a region.
-    var didExitRegion: RegionEvent?
-    
-    /// The set of all monitored regions. Updated by the `updateRegions` method.
-    private var allMonitoredRegions = Set<CLRegion>()
+/// Handles uploading analytics data to the network.
+final class RegionEventsNetworkController {
+    private let urlSession: URLSession
 
-    /// The location manager used to monitor regions and visits
-    private let locationManager = CLLocationManager()
+    /// Creates a `RegionEventsNetworkController`.
+    convenience init() {
+        self.init(urlSession: .regionEventsURLSession)
+    }
+
+    /// Creates a `RegionEventsNetworkController`.
+    ///
+    /// - Parameter urlSession: A `URLSession` to make request on.
+    init(urlSession: URLSession) {
+        self.urlSession = urlSession
+    }
+    
+    /// A handler that is used when response is recieved from a network request.
+    ///
+    /// - Parameter Bool: A boolean value that corresponds to whether or not the request should be retried.
+    typealias CompletionHandler = (Bool) -> Void
+    
+    /// A handler that is used when a error is recieved from a network request.
+    ///
+    /// - Parameter Error: The error resulting from the network request.
+    typealias ErrorHandler = (Error) -> Void
+
+    /// Sends an array of region events.
+    ///
+    /// - Parameters:
+    ///   - events: A `[AnalyticsEvent]` to send.
+    ///   - completionHandler: A `CompletionHandler` for providing a response of the data recieved from the request.
+    ///   - errorHandler: A `ErrorHandler` for providing an error recieved from the request.
+    /// - Returns: The `URLSessionDataTask` for the request.
+    @discardableResult
+    func send(_ request: LocationService.Request, completionHandler: @escaping CompletionHandler, errorHandler: @escaping ErrorHandler) -> URLSessionDataTask {
+        return task(urlRequest: request.urlRequest, completionHandler: completionHandler, errorHandler: errorHandler)
+    }
+
+    /// Returns an initialized `URLSessionDataTask`.
+    ///
+    /// - Parameters:
+    ///   - events: A `[AnalyticsEvent]` to send.
+    ///   - completionHandler: A `CompletionHandler` for providing a response of the data recieved from the request.
+    ///   - errorHandler: A `ErrorHandler` for providing an error recieved from the request.
+    /// - Returns: The `URLSessionDataTask` for the request.
+    private func task(urlRequest: URLRequest, completionHandler: @escaping CompletionHandler, errorHandler: @escaping ErrorHandler) -> URLSessionDataTask {
+        let handler = { (data: Data?, response: URLResponse?, error: Error?) in
+            if let error = error {
+                errorHandler(error)
+                return
+            }
+            
+            guard let httpURLResponse = response as? HTTPURLResponse else {
+                completionHandler(true)
+                return
+            }
+
+            // For 2xx response codes no retry is needed
+            // For 3xx, 4xx, 5xx response codes, a retry is needed
+            let isValidResponse = (200..<300).contains(httpURLResponse.statusCode)
+            completionHandler(isValidResponse)
+        }
+        return urlSession.dataTask(with: urlRequest, completionHandler: handler)
+    }
+}
+
+extension URLSession {
+    /// The `URLSession` used to submit analytics data.
+    static let regionEventsURLSession: URLSession =  {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpAdditionalHeaders = [
+            "Content-Type" : "application/json"
+        ]
+        return URLSession(configuration: configuration)
+    }()
+}
+
+
+extension LocationService {
+    /// Handles network requests related to the `LocationService`.
+    struct Request {
+        
+        /// The HTTP request method options.
+        enum Method: String {
+            
+            /// The HTTP POST method.
+            case POST = "POST"
+        }
+        
+        /// The `Request`'s `URLRequest` that task are completed on.
+        public let urlRequest: URLRequest
+        
+        /// A `Request` configured to upload an array of `RegionEvent`s
+        ///
+        /// - Parameters:
+        ///   - evemts: The array of `RegionEvent`s to upload
+        ///   - credentialProvider: An object that handle providing credentials for a request.
+        /// - Returns: A `Request` configured to upload the region events.
+        public static func uploadEvents(_ events: [RegionEvent], credentialProvider: ConnectionCredentialProvider) -> Request {
+            let data = events.map { $0.toJSON(stripPrefix: true) }
+            return Request(path: "/location_events", method: .POST, data: data, credentialProvider: credentialProvider)
+        }
+        
+        private init(path: String,
+                     method: Method,
+                     data: [JSON],
+                     credentialProvider: ConnectionCredentialProvider) {
+            let url = API.locationBase.appendingPathComponent(path)
+            
+            var request = URLRequest(url: url)
+            request.httpMethod = method.rawValue
+            request.httpBody = try? JSONSerialization.data(withJSONObject: data, options: JSONSerialization.WritingOptions())
+            
+            if let userToken = credentialProvider.userToken, !userToken.isEmpty {
+                request.addIftttServiceToken(userToken)
+            }
+            
+            self.urlRequest = request
+        }
+    }
+}
+
+/// Helps with processing regions from connections and handles storing and uploading location event updates from the system to IFTTT.
+final class LocationService: NSObject, SynchronizationSubscriber {
+    /// Used to monitor regions.
+    private let regionsMonitor: RegionsMonitor
+    private let regionEventsRegistry: RegionEventsRegistry
+    private let connectionsRegistry: ConnectionsRegistry
+    private let networkController = RegionEventsNetworkController()
+    private let regionEventTriggerPublisher: EventPublisher<SynchronizationTriggerEvent>
+    
+    private var currentTask: URLSessionDataTask?
     
     private struct Constants {
         /// According to the CoreLocationManager monitoring docs, the system can only monitor a total of 20 regions.
         static let MaxCoreLocationManagerMonitoredRegionsCount = 20
+        static let SanityThreshold = 20
     }
     
     /// Creates an instance of `LocationService`.
@@ -51,168 +152,169 @@ final class LocationService: NSObject {
     /// - Parameters:
     ///     - allowsBackgroundLocationUpdates: Determines whether or not the location manager using in the service should allow for background location updates.
     /// - Returns: An initialized instance of `LocationService`.
-    init(allowsBackgroundLocationUpdates: Bool) {
+    init(allowsBackgroundLocationUpdates: Bool,
+         regionEventsRegistry: RegionEventsRegistry,
+         connectionsRegistry: ConnectionsRegistry,
+         eventPublisher: EventPublisher<SynchronizationTriggerEvent>) {
+        
+        self.regionsMonitor = RegionsMonitor(allowsBackgroundLocationUpdates: allowsBackgroundLocationUpdates)
+        self.regionEventsRegistry = regionEventsRegistry
+        self.connectionsRegistry = connectionsRegistry
+        self.regionEventTriggerPublisher = eventPublisher
+        
         super.init()
-        
-        locationManager.delegate = self
-        locationManager.allowsBackgroundLocationUpdates = allowsBackgroundLocationUpdates
-        if #available(iOS 11.0, *) {
-            locationManager.showsBackgroundLocationIndicator = true
-        }
-    }
-    
-    // MARK: - Public API
-    
-    /// Starts monitoring of parameter regions. Starts monitoring visits if needed.
-    ///
-    /// - Parameters:
-    ///     - regions: The set of regions to monitor.
-    func startMonitoringRegions(_ regions: Set<CLRegion>) {
-        self.allMonitoredRegions = regions
-        updateMonitoring(with: CLLocationManager.authorizationStatus())
-    }
-    
-    /// Stops monitoring of parameter regions. Stops monitoring visits if needed.
-    ///
-    /// - Parameters:
-    ///     - regions: The set of regions to un-monitor.
-    func stopMonitoringRegions(_ regions: Set<CLRegion>) {
-        regions.forEach {
-            locationManager.stopMonitoring(for: $0)
-            allMonitoredRegions.remove($0)
-        }
-        if !shouldStartVisitsMonitoring() {
-            locationManager.stopMonitoringVisits()
-        }
-    }
-    
-    // MARK: - Private Methods
-    
-    /// Stops region monitoring and visits monitoring.
-    private func stopMonitor() {
-        allMonitoredRegions.forEach { (region) in
-            if CLLocationManager.isMonitoringAvailable(for: type(of: region)) {
-                locationManager.stopMonitoring(for: region)
-            }
-        }
-        locationManager.stopMonitoringVisits()
-    }
-    
-    /// Starts region monitoring for the regions set on the service.
-    private func startMonitor() {
-        let monitoredRegions = locationManager.monitoredRegions
-        // Go through the new regions we got passed in and start monitoring those regions if they're not being monitored
-        allMonitoredRegions.forEach { (region) in
-            if !monitoredRegions.contains(region) && CLLocationManager.isMonitoringAvailable(for: type(of: region)) {
-                locationManager.startMonitoring(for: region)
-            }
-        }
-    }
-    
-    /// Updates the monitoring of regions set on the service.
-    private func updateMonitoring(with status: CLAuthorizationStatus) {
-        switch status {
-        case .authorizedAlways:
-            if shouldStartVisitsMonitoring() {
-                /*
-                 If we need to start visits monitoring then we can't start the region monitor right now.
-                 We have to wait until we know where the user is before we can start monitoring regions. ]
-                 This is due to the system only allowing for monitoring a maximum of 20 regions.
-                 */
-                locationManager.startMonitoringVisits()
-            } else {
-                startMonitor()
-            }
-        default:
-            locationManager.stopMonitoringVisits()
-            stopMonitor()
-        }
-    }
-    
-    /// Determines whether or not the visitsMonitor needs to be started or not.
-    /// Checks to see what locations are currently being monitored, what locations we need to monitor, and the intersection of these sets.
-    /// If the value: count of the currently monitored regions + (count of regions we want to monitor - count of intersection of those sets) > `Constants.MaxCoreLocationManagerMonitoredRegionsCount` then we return true otherwise we return false
-    ///
-    /// - returns: A boolean value that determines whether or not we need to start visits monitoring.
-    private func shouldStartVisitsMonitoring() -> Bool {
-        let currentlyMonitoredRegions = locationManager.monitoredRegions
-        let intersection = currentlyMonitoredRegions.intersection(allMonitoredRegions)
-        
-        return (currentlyMonitoredRegions.count + (allMonitoredRegions.count - intersection.count)) > Constants.MaxCoreLocationManagerMonitoredRegionsCount
-    }
-    
-    /// Updates the list of registered regions around the parameter visit.
-    ///
-    /// - Parameters:
-    ///     - visit: The visit to use in determining what regions get monitored. Only the 20 closest regions to this visit get monitored.
-    private func update(around visit: CLVisit) {
-        let visitLocation = CLLocation(latitude: visit.coordinate.latitude, longitude: visit.coordinate.longitude)
-        let regionsClosestToLocation = allMonitoredRegions.compactMap { $0 as? CLCircularRegion }
-            .sorted { (region1, region2) -> Bool in
-                let region1Location = CLLocation(latitude: region1.center.latitude, longitude: region1.center.longitude)
-                let region2Location = CLLocation(latitude: region2.center.latitude, longitude: region2.center.longitude)
-                return visitLocation.distance(from: region1Location) < visitLocation.distance(from: region2Location)
-            }
-        let topClosest = regionsClosestToLocation[..<Constants.MaxCoreLocationManagerMonitoredRegionsCount]
 
-        startMonitoringRegions(Set(topClosest))
+        start()
     }
     
-    deinit {
-        locationManager.delegate = nil
+    private func updateRegionsFromRegistry() {
+        let regions: Set<CLCircularRegion> = connectionsRegistry.getConnections().reduce(.init()) { (currSet, store) -> Set<CLCircularRegion> in
+            guard store.status == .enabled else { return currSet }
+            var set = currSet
+            store.locationRegions.forEach {
+                set.insert($0)
+            }
+            return set
+        }
+        regionsMonitor.updateRegions(regions)
     }
-}
+    
+    @objc private func connectionsChanged() {
+        updateRegionsFromRegistry()
+    }
+    
+    private func start() {
+        updateRegionsFromRegistry()
+        
+        self.regionsMonitor.didEnterRegion = { region in
+            self.recordRegionEvent(with: region, kind: .entry)
+        }
 
-extension LocationService: ConnectionMonitorSubscriber {
-    func processUpdate(with connection: Connection) {
-        func regions(matching statuses: Set<Connection.Status>) -> Set<CLCircularRegion> {
-            guard statuses.contains(connection.status) else { return .init() }
+        self.regionsMonitor.didExitRegion = { region in
+            self.recordRegionEvent(with: region, kind: .exit)
+        }
+    }
+    
+    private func recordRegionEvent(with region: CLRegion, kind: RegionEvent.Kind) {
+        var backgroundTaskIdentifier: UIBackgroundTaskIdentifier?
+        backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(expirationHandler: {
+            guard let identifier = backgroundTaskIdentifier else { return }
+            if identifier != UIBackgroundTaskIdentifier.invalid {
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+        })
+        
+        let event = RegionEvent(kind: kind, triggerSubscriptionId: region.identifier)
+        regionEventsRegistry.add(event)
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            let event = SynchronizationTriggerEvent(source: .regionsUpdate,
+                                                    backgroundFetchCompletionHandler: nil)
             
-            return connection.activeTriggers.compactMap { (trigger) -> CLCircularRegion? in
+            self.regionEventTriggerPublisher.onNext(event)
+            
+            if let backgroundTaskIdentifier = backgroundTaskIdentifier, backgroundTaskIdentifier != UIBackgroundTaskIdentifier.invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTaskIdentifier)
+            }
+        }
+    }
+    
+    private func processUpdate(with connections: Set<Connection.ConnectionStorage>) {
+        var overlappingSet = Set<CLCircularRegion>()
+        connections.forEach {
+            $0.activeTriggers.forEach { trigger in
                 switch trigger {
-                case .location(let region): return region
+                case .location(let region): overlappingSet.insert(region)
                 }
             }
         }
-        
-        let monitoredRegions = regions(matching: [.enabled])
-        let unmonitoredRegions = regions(matching: [.disabled, .unknown, .initial])
-        
-        monitor(toStart: monitoredRegions, toStop: unmonitoredRegions)
+
+        regionsMonitor.updateRegions(overlappingSet)
     }
     
-    private func monitor(toStart: Set<CLRegion>, toStop: Set<CLRegion>) {
-        guard CLLocationManager.locationServicesEnabled() else { return }
+    // MARK: - SynchronizationSubscriber
+    var name: String {
+        return "LocationService"
+    }
+    
+    func shouldParticipateInSynchronization(source: SynchronizationSource) -> Bool {
+        let hasLocationTriggers = connectionsRegistry.getConnections().reduce(false) { (currentResult, connection) -> Bool in
+            return currentResult || connection.hasLocationTriggers
+        }
+        let credentialProvider = UserAuthenticatedRequestCredentialProvider.standard
+
+        let isLoggedIn = credentialProvider.userToken != nil
+        if !(hasLocationTriggers && isLoggedIn) {
+            regionEventsRegistry.removeAll()
+        }
+        return hasLocationTriggers &&
+            credentialProvider.userToken != nil
+    }
+    
+    private func exponentialBackoffTiming(for retryCount: Int) -> DispatchTimeInterval {
+        let seconds = Int(pow(2, Double(retryCount)))
+        return .seconds(seconds)
+    }
+    
+    func performSynchronization(completion: @escaping (Bool, Error?) -> Void) {
+        processUpdate(with: connectionsRegistry.getConnections())
         
-        DispatchQueue.main.async { [weak self] in
-            self?.stopMonitoringRegions(toStop)
-            self?.startMonitoringRegions(toStart)
+        if currentTask != nil {
+            completion(false, nil)
+            return
+        }
+        
+        let credentialProvider = UserAuthenticatedRequestCredentialProvider()
+            
+        let existingRegionEvents = regionEventsRegistry.getRegionEvents()
+        if existingRegionEvents.count > Constants.SanityThreshold {
+            regionEventsRegistry.remove(existingRegionEvents)
+            completion(false, nil)
+        } else if existingRegionEvents.count > 0 {
+            performRequest(events: existingRegionEvents,
+                           credentialProvider: credentialProvider,
+                           completion: completion)
+        } else {
+            completion(false, nil)
         }
     }
-}
-
-extension LocationService: CLLocationManagerDelegate {
-    func locationManager(_ manager: CLLocationManager, didStartMonitoringFor region: CLRegion) {
-        didStartMonitoringRegion?(region)
-    }
     
-    func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
-        didFailMonitoringRegion?(region, error)
-    }
-    
-    func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
-        didEnterRegion?(region)
-    }
-    
-    func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
-        didExitRegion?(region)
-    }
-    
-    func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
-        update(around: visit)
-    }
-    
-    func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
-        updateMonitoring(with: status)
+    private func performRequest(events: [RegionEvent],
+                                credentialProvider: ConnectionCredentialProvider,
+                                numberOfRetries: Int = 3,
+                                retryCount: Int = 0,
+                                completion: @escaping (Bool, Error?) -> Void) {
+        currentTask?.cancel()
+        currentTask = nil
+        currentTask = networkController.send(.uploadEvents(events, credentialProvider: credentialProvider), completionHandler: { [weak self] (success) in
+            if success {
+                self?.regionEventsRegistry.remove(events)
+            }
+            self?.currentTask = nil
+            completion(success, nil)
+        }, errorHandler: { [weak self] (error) in
+            guard let self = self else { return }
+            if (error as NSError).code == NSURLErrorCancelled {
+                if retryCount == numberOfRetries {
+                    completion(false, nil)
+                }
+                return
+            }
+            
+            if retryCount < numberOfRetries {
+                let count = retryCount + 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + self.exponentialBackoffTiming(for: count)) {
+                    self.performRequest(events: events,
+                                        credentialProvider: credentialProvider,
+                                        numberOfRetries: numberOfRetries,
+                                        retryCount: count,
+                                        completion: completion)
+                }
+            } else {
+                self.currentTask = nil
+                completion(false, error)
+            }
+        })
+        currentTask?.resume()
     }
 }

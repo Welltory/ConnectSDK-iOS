@@ -118,15 +118,16 @@ public class ConnectButtonController {
         if let status = connection?.status {
             state = (status == .initial) ? .Created : .Enabled
         }
+        Keychain.set(value: userToken, for: Keychain.Key.UserToken.rawValue)
         connection?.status = .enabled
         
         if let connection = connection {
-            fetchConnection(for: connection.id, updateConnectButton: false, isAuthenticated: userToken != nil)
             Analytics.shared.track(.StateChange,
                                    object: connection,
                                    state: state)
             let activation = ConnectionActivation(userToken: userToken,
                                                   connection: connection)
+            connectionsRegistry.update(with: connection)
             delegate?.connectButtonController(self, didFinishActivationWithResult: .success(activation))
         }
     }
@@ -139,7 +140,7 @@ public class ConnectButtonController {
         connection?.status = .disabled
         
         if let connection = connection {
-            ConnectionsMonitor.shared.update(with: connection)
+            connectionsRegistry.update(with: connection)
             delegate?.connectButtonController(self, didFinishDeactivationWithResult: .success(connection))
         }
     }
@@ -156,32 +157,59 @@ public class ConnectButtonController {
     public private(set) weak var delegate: ConnectButtonControllerDelegate?
 
     private let connectionConfiguration: ConnectionConfiguration
+    private let connectionsRegistry = ConnectionsRegistry()
     private let connectionHandoffFlow: ConnectionHandoffFlow
     private let connectionNetworkController = ConnectionNetworkController()
     private let serviceIconNetworkController = ServiceIconsNetworkController()
     private let reachability = Reachability()
     private let connectionVerificationSession: ConnectionVerificationSession
+    
+    /// The locale that will be used for localizing the flow.
+    static var locale: Locale = {
+        return determineLocale()
+    }()
 
+    /// Determines the locale to use based on the user's preferred language and falls back to the current `Locale` chosen by the user.
+    ///
+    /// - Returns: The `Locale` to use in localizing the flow.
+    public static func determineLocale() -> Locale {
+        guard let preferredLanguage = Locale.preferredLanguages.first else { return .current }
+        return Locale(identifier: preferredLanguage)
+    }
+    
     /// Creates a new `ConnectButtonController`.
     ///
     /// - Parameters:
     ///   - connectButton: The `ConnectButton` that the controller is handling interaction for.
     ///   - connectionConfiguration: The `ConnectionConfiguration` with information for authenticating a `Connection`.
+    ///   - locale: An overridable `Locale` that will get used to display strings in the SDK. The default is `nil`. If this parameter is set to `nil`, the user's current will be used.
     ///   - delegate: A `ConnectInteractionDelegate` to respond to various events that happen on the controller.
-    public init(connectButton: ConnectButton, connectionConfiguration: ConnectionConfiguration, delegate: ConnectButtonControllerDelegate) {
+    public init(connectButton: ConnectButton,
+                connectionConfiguration: ConnectionConfiguration,
+                locale: Locale = determineLocale(),
+                delegate: ConnectButtonControllerDelegate) {
         self.button = connectButton
+
         self.connectionConfiguration = connectionConfiguration
+        ConnectButtonController.locale = locale
         self.connectionHandoffFlow = ConnectionHandoffFlow(connectionId: connectionConfiguration.connectionId,
                                                                  credentialProvider: connectionConfiguration.credentialProvider,
-                                                                 activationRedirect: connectionConfiguration.redirectURL)
+                                                                 activationRedirect: connectionConfiguration.redirectURL,
+                                                                 skipConnectionConfiguration: connectionConfiguration.skipConnectionConfiguration)
         self.connection = connectionConfiguration.connection
         self.delegate = delegate
         self.connectionVerificationSession = ConnectionVerificationSession()
         
         self.button.analyticsDelegate = self
         
+        setupKeychain(for: connectionConfiguration.credentialProvider)
         setupConnection(for: connection, animated: false)
         setupVerification()
+    }
+    
+    private func setupKeychain(for credentialProvider: ConnectionCredentialProvider) {
+        Keychain.set(value: credentialProvider.userToken, for: Keychain.Key.UserToken.rawValue)
+        Keychain.set(value: credentialProvider.inviteCode, for: Keychain.Key.InviteCode.rawValue)
     }
     
     private func setupVerification() {
@@ -191,7 +219,12 @@ public class ConnectButtonController {
     }
     
     private func handleOutcome(_ outcome: ConnectionVerificationSession.Outcome) {
-        connectionVerificationSession.dismiss { [weak self] in
+        var isUserCancelled = false
+        if case .error(let innerError) = outcome,
+            case .canceled = innerError {
+            isUserCancelled = true
+        }
+        connectionVerificationSession.dismiss(isUserCancelled: isUserCancelled) { [weak self] in
             // Determine the next step based on the redirect result
             let nextStep: ActivationStep = {
                 switch outcome {
@@ -225,7 +258,7 @@ public class ConnectButtonController {
             return
         }
         
-        ConnectionsMonitor.shared.update(with: connection)
+        connectionsRegistry.update(with: connection)
         Analytics.shared.track(.Impression,
                                location: .connectButtonImpression,
                                object: connection)
@@ -251,9 +284,7 @@ public class ConnectButtonController {
     
     private func fetchConnection(for id: String,
                                  numberOfRetries: Int = 3,
-                                 retryCount: Int = 0,
-                                 updateConnectButton: Bool = true,
-                                 isAuthenticated: Bool = false) {
+                                 retryCount: Int = 0) {
         button.animator(for: .buttonState(.loading(message: "button.state.loading".localized))).perform(animated: true)
         button.animator(for: .footerValue(FooterMessages.worksWithIFTTT.value)).perform(animated: false)
         connectionFetchingDataTask?.cancel()
@@ -265,12 +296,7 @@ public class ConnectButtonController {
             switch response.result {
             case .success(let connection):
                 self.connection = connection
-                if isAuthenticated {
-                    ConnectionsMonitor.shared.update(with: connection)
-                }
-                if updateConnectButton {
-                    self.setupConnection(for: connection, animated: true)
-                }
+                self.setupConnection(for: connection, animated: true)
 
             case .failure:
                 if retryCount < numberOfRetries {
@@ -279,16 +305,14 @@ public class ConnectButtonController {
                         self.fetchConnection(for: id, retryCount: count)
                     }
                 } else {
-                    if updateConnectButton {
-                        let footer = ConnectButtonController.FooterMessages.loadingFailed.value
-                        self.button.animator(for: .buttonState(.loadingFailed, footerValue: footer)).perform(animated: true)
-                        self.button.footerInteraction.isTapEnabled = true
-                        self.button.footerInteraction.onSelect = { [weak self] in
-                            self?.fetchConnection(for: id)
-                            self?.reachability?.stopNotifier()
-                        }
-                        self.setupReachabilityForConnectionLoading(id: id)
+                    let footer = ConnectButtonController.FooterMessages.loadingFailed.value
+                    self.button.animator(for: .buttonState(.loadingFailed, footerValue: footer)).perform(animated: true)
+                    self.button.footerInteraction.isTapEnabled = true
+                    self.button.footerInteraction.onSelect = { [weak self] in
+                        self?.fetchConnection(for: id)
+                        self?.reachability?.stopNotifier()
                     }
+                    self.setupReachabilityForConnectionLoading(id: id)
                 }
             }
         }
@@ -396,15 +420,19 @@ public class ConnectButtonController {
 
             switch self {
             case .worksWithIFTTT:
-                let text = NSMutableAttributedString(string: "button.footer.works_with".localized,
+                let string = "button.footer.works_with".localized + " "
+                let text = NSMutableAttributedString(string: string,
                                                      attributes: [.font : Constants.footnoteFont])
                 text.append(iftttWordmark)
                 return text
                 
             case .enterEmail:
-                let text = NSMutableAttributedString(string: "button.footer.email.prefix".localized,
+                let string = "button.footer.email.prefix".localized + " "
+                let text = NSMutableAttributedString(string: string,
                                                      attributes: [.font : Constants.footnoteFont])
-                text.append(iftttWordmark)
+                let iftttRange = (string as NSString).range(of: "IFTTT")
+                text.replaceCharacters(in: iftttRange, with: iftttWordmark)
+                
                 text.append(NSAttributedString(string: " ")) // Adds a space before the underline starts
                 text.append(NSAttributedString(string: "button.footer.email.postfix".localized,
                                                attributes: [.font : Constants.footnoteFont,
@@ -418,13 +446,11 @@ public class ConnectButtonController {
                                                        .foregroundColor : Constants.errorTextColor])
                 
             case let .creatingAccount(email):
-                let text = NSMutableAttributedString(string: "button.footer.accountCreation.prefix".localized,
+                let string = "button.footer.accountCreation".localized(with: email)
+                let text = NSMutableAttributedString(string: string,
                                                      attributes: [.font : Constants.footnoteFont])
-                text.append(iftttWordmark)
-                text.append(NSAttributedString(string: " "))
-                text.append(NSMutableAttributedString(string: "button.footer.accountCreation.postfix".localized(with: email),
-                                                      attributes: [.font : Constants.footnoteFont]))
-                
+                let iftttRange = (string as NSString).range(of: "IFTTT")
+                text.replaceCharacters(in: iftttRange, with: iftttWordmark)
                 return text
                 
             case .loadingFailed:
@@ -789,7 +815,8 @@ public class ConnectButtonController {
         connectionNetworkController.start(urlRequest: request.urlRequest) { response in
             progress.finish {
                 switch response.result {
-                case .success:
+                case .success(let connection):
+                    self.connection = connection
                     self.transition(to: .disconnected)
                 case .failure(let error):
                     self.handleDeactivationFailed(error: .networkError(error))

@@ -9,13 +9,7 @@ import Foundation
 import CoreLocation
 
 /// Enumerates supported native service triggers
-enum Trigger: Equatable, Hashable, CaseIterable {
-    static var allCases: [Trigger] {
-        return [
-            .location(region: .init())
-        ]
-    }
-    
+enum Trigger: Hashable {
     private struct Constants {
         static let LocationIdentifer = "location"
     }
@@ -29,8 +23,8 @@ enum Trigger: Equatable, Hashable, CaseIterable {
     /// Uniquely identifies this trigger.
     var identifier: String {
         switch self {
-        case .location:
-            return Constants.LocationIdentifer
+        case .location(let region):
+            return region.identifier
         }
     }
     
@@ -40,14 +34,36 @@ enum Trigger: Equatable, Hashable, CaseIterable {
     ///     - json: The `JSON` object corresponding to the trigger
     ///     - triggerId: A value that uniquely identifies this trigger. Used in registering multiple unique triggers with the system.
     init?(json: JSON, triggerId: String) {
-        guard let fieldId = json["field_id"] as? String else { return nil }
+        guard let fieldId = json["field_id"] as? String else {
+            return nil
+        }
         
         switch fieldId {
         case Constants.LocationIdentifer:
-            guard let region = CLCircularRegion(json: json, triggerId: triggerId) else { return nil }
+            guard let region = CLCircularRegion(json: json, triggerId: triggerId) else {
+                return nil
+            }
             self = .location(region: region)
         default:
             return nil
+        }
+    }
+    
+    init?(parser: Parser) {
+        let locationParser = parser[Constants.LocationIdentifer]
+        if let region = CLCircularRegion(parser: locationParser) {
+            self = .location(region: region)
+            return
+        }
+        return nil
+    }
+    
+    func toJSON() -> JSON {
+        switch self {
+        case .location(let region):
+            return [
+                Constants.LocationIdentifer: region.toUserDefaultsJSON()
+            ]
         }
     }
  
@@ -59,18 +75,3 @@ enum Trigger: Equatable, Hashable, CaseIterable {
         return lhs.identifier == rhs.identifier
     }
 }
-
-/// Enumerates permissions to be requested from the user. Determined by the triggers for a Connection.
-enum NativePermission: CaseIterable, Equatable {
-    
-    /// Describes an always required location permission.
-    case location
-}
-
-func ==(lhs: NativePermission, rhs: NativePermission) -> Bool {
-    switch (lhs, rhs) {
-    case (.location, .location):
-        return true
-    }
-}
-
