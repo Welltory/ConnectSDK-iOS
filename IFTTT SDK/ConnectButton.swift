@@ -7,10 +7,10 @@
 
 import UIKit
 
-/// Delegate methods for the display of the connect button.
-protocol ConnectButtonDisplayDelegate: class {
-    /// Called when the connect button is about to appear in its superview.
-    func willAppear()
+/// Delegate methods for performing any tracking of events from the ConnectButton.
+protocol ConnectButtonAnalyticsDelegate: class {
+    /// Called when the user is shown the suggested email address.
+    func trackSuggestedEmailImpression()
 }
 
 // MARK: - Connect Button
@@ -39,8 +39,8 @@ public class ConnectButton: UIView {
         }
     }
     
-    /// The display delegate for this connect button.
-    weak var displayDelegate: ConnectButtonDisplayDelegate?
+    /// The analytics delegate for this connect button.
+    weak var analyticsDelegate: ConnectButtonAnalyticsDelegate?
     
     ///
     /// Create a `Connection`'s connect button. This is primarily an internal type. This is the only public method. Use with `ConnectButtonController`.
@@ -269,13 +269,6 @@ public class ConnectButton: UIView {
         footerLabelAnimator.configure(.attributed(initialFooterText))
     }
     
-    public override func willMove(toWindow newWindow: UIWindow?) {
-        super.willMove(toWindow: newWindow)
-        guard newWindow != nil else { return }
-        
-        displayDelegate?.willAppear()
-    }
-    
     private let backgroundView = PillView()
     
     // MARK: Email view
@@ -285,7 +278,7 @@ public class ConnectButton: UIView {
     /// - Parameters:
     ///   - placeholderText: The placeholder text for the email field when it is empty
     ///   - confirmButtonImage: The image asset to use for the email confirm button
-    func configureEmailField(placeholderText: String, confirmButtonAsset: UIImage) {
+    func configureEmailField(placeholderText: String, confirmButtonAsset: UIImage?) {
         emailEntryField.placeholder = placeholderText
         emailConfirmButton.imageView.image = confirmButtonAsset
     }
@@ -318,7 +311,7 @@ public class ConnectButton: UIView {
     }
     
     private let footerLabelAnimator = LabelAnimator {
-        $0.numberOfLines = 1
+        $0.numberOfLines = 0
         $0.textAlignment = .center
         $0.lineBreakMode = .byTruncatingMiddle
     }    
@@ -338,13 +331,10 @@ public class ConnectButton: UIView {
     
     // MARK: Layout
     
-    /// A key used by an app to determine if it should hide the footer on the Connect Button.
-    static let shouldHideFooterUserDefaultsKey = "appShouldHideConnectButtonFooter"
-    
     private func createLayout() {
         
         // In some cases, we need to hide the footer on the Connect Button SDK. Introducing a key check to determine if the footer should be shown.
-        let shouldHideFooter = UserDefaults.standard.bool(forKey: ConnectButton.shouldHideFooterUserDefaultsKey)
+        let shouldHideFooter = UserDefaults.shouldHideFooter
         
         let stackView: UIStackView
         
@@ -722,6 +712,7 @@ private extension ConnectButton {
                     if suggestedEmail == nil || shouldBecomeFirstResponder {
                         self.emailEntryField.becomeFirstResponder()
                     }
+                    self.analyticsDelegate?.trackSuggestedEmailImpression()
                     resetKnob()
                 }
                 

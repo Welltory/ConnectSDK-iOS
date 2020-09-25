@@ -1,5 +1,5 @@
 //
-//  Connection_internal.swift
+//  Connection+Parsing.swift
 //  IFTTT SDK
 //
 //  Copyright © 2019 IFTTT. All rights reserved.
@@ -30,10 +30,16 @@ extension Connection {
         
         self.coverImages = CoverImage.images(with: parser["cover_image"])
         
-        self.valuePropositions = parser["value_propositions"].compactMap {
-            Connection.ValueProposition(parser: $0)
+        self.valuePropositionsParser = parser["value_propositions"]
+
+        self.features = parser["features"].compactMap {
+            Connection.Feature(parser: $0)
         }
+        
+        let activeTriggers = Connection.parseTriggers(parser)
+        self.activeTriggers = activeTriggers
     }
+    
     static func parseAppletsResponse(_ parser: Parser) -> [Connection]? {
         if let type = parser["type"].string {
             switch type {
@@ -48,6 +54,28 @@ extension Connection {
             }
         }
         return nil
+    }
+    
+    static func parseTriggers(_ parser: Parser) -> Set<Trigger> {
+        switch parser["user_connection"] {
+        case .dictionary(let json):
+            guard let userFeatures = json["user_features"] as? [JSON] else { return [] }
+            let enabledUserFeatures = userFeatures.filter { dict -> Bool in
+                guard let enabled = dict["enabled"] as? Bool else { return false }
+                return enabled
+            }
+            
+            let userFeatureTriggers = enabledUserFeatures.compactMap { $0["user_feature_triggers"] as? [JSON] }.reduce([], +)
+            let allTriggers = userFeatureTriggers.compactMap { (userFeatureTrigger) -> [Trigger] in
+                guard let userTriggerId = userFeatureTrigger["id"] as? String else { return [] }
+                guard let userFields = userFeatureTrigger["user_fields"] as? [JSON] else { return [] }
+                return userFields.compactMap { Trigger(json: $0, triggerId: userTriggerId) }
+            }.reduce([], +)
+            
+            return Set(allTriggers)
+        default:
+            return []
+        }
     }
 }
 
@@ -72,14 +100,15 @@ extension Connection.Service {
     }
 }
 
-private extension Connection.ValueProposition {
+private extension Connection.Feature {
     init?(parser: Parser) {
         guard
-            let description = parser["description"].string,
+            let title = parser["title"].string,
             let iconURL = parser["icon_url"].url else {
                 return nil
         }
-        self.details = description
+        self.details = parser["description"].string
+        self.title = title
         self.iconURL = iconURL
     }
 }
@@ -96,5 +125,39 @@ private extension Connection.CoverImage {
         return images.reduce(into: [Connection.CoverImage.Size : Connection.CoverImage]()) { (dict, image) in
             dict[image.size] = image
         }
+    }
+}
+
+extension Connection.ConnectionStorage {
+    private struct Keys {
+        static let Id = "id"
+        static let Status = "status"
+        static let ActiveTriggers = "activeTriggers"
+    }
+    
+    init(connection: Connection) {
+        self.init(id: connection.id,
+                  status: connection.status,
+                  activeTriggers: connection.activeTriggers)
+    }
+    
+    init?(json: JSON) {
+        let parser = Parser(content: json)
+        guard let id = parser[Keys.Id].string,
+            let status = parser[Keys.Status].representation(of: Connection.Status.self) else { return nil }
+        
+        let triggers = parser[Keys.ActiveTriggers].compactMap { Trigger(parser: $0) }
+        self.init(id: id,
+                  status: status,
+                  activeTriggers: Set(triggers))
+    }
+    
+    func toJSON() -> JSON {
+        let mappedTriggers = activeTriggers.map { $0.toJSON() }
+        return [
+            Keys.Id: id,
+            Keys.Status: status.rawValue,
+            Keys.ActiveTriggers: mappedTriggers
+        ]
     }
 }
